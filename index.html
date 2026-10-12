@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <!-- Mobile: Viewport und Theme-Farbe für die Statusleiste -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="description" content="XYMYX – system online." />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>XYMYX</title>
+  <style>
+    /* Grundlayout: Seite füllt den gesamten Bildschirm */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #0f0;
+      font-family: "Courier New", Courier, monospace;
+    }
+
+    /* Canvas liegt vollflächig hinter allem */
+    #matrix {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #000;
+    }
+
+    /* Text unter dem Logo (wird per JS positioniert) */
+    #status {
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #00ff66;
+      font-size: clamp(0.7rem, 2.2vw, 0.95rem);
+      letter-spacing: 0.12em;
+      text-shadow: 0 0 8px rgba(0, 255, 100, 0.7);
+      white-space: nowrap;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    /* Blinkender Cursor hinter dem getippten Text */
+    #status .cursor {
+      display: inline-block;
+      width: 0.55em;
+      margin-left: 2px;
+      border-right: 2px solid #00ff66;
+      animation: blink 1s step-end infinite;
+      vertical-align: baseline;
+    }
+
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+
+    /* Bei reduzierter Bewegung: kein Blinken */
+    @media (prefers-reduced-motion: reduce) {
+      #status .cursor {
+        animation: none;
+        opacity: 1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- Hier wird der Matrix-Regen und das Logo gezeichnet -->
+  <canvas id="matrix" aria-hidden="true"></canvas>
+
+  <!-- Terminal-Text unter dem Logo -->
+  <p id="status" aria-live="polite"><span id="status-text"></span><span class="cursor" aria-hidden="true"></span></p>
+
+  <script>
+    // ============================================================
+    // XYMYX – Matrix-Startseite
+    // Alles in einer Datei: HTML, CSS und JavaScript
+    // ============================================================
+
+    (function () {
+      "use strict";
+
+      // ---- DOM-Elemente ----
+      const canvas = document.getElementById("matrix");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const statusEl = document.getElementById("status");
+      const statusTextEl = document.getElementById("status-text");
+
+      // ---- Zeichensatz für den Regen (Katakana, Ziffern, Buchstaben) ----
+      const CHARSET =
+        "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン" +
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+      // ---- Zeit-Konstanten (in Millisekunden) ----
+      const LOGO_DELAY_MS = 3000;      // Nach so langer Zeit erscheint das Logo
+      const TARGET_FPS = 30;           // Framerate begrenzen (schonender für Akku/CPU)
+      const FRAME_MS = 1000 / TARGET_FPS;
+      const STATUS_TEXT = "system online.";
+
+      // ---- ASCII-Art für „XYMYX“ (jedes Zeichen = eine Zelle im Raster) ----
+      // Leerzeichen = Regen fällt weiter; andere Zeichen = Logo-Zellen
+      // Jedes Nicht-Leerzeichen markiert eine Logo-Zelle.
+      // Die sichtbaren Zeichen kommen später aus dem Regen (CHARSET).
+      // Buchstaben X Y M Y X (je 5 Spalten, 1 Leerzeichen Abstand).
+      const LOGO_ROWS = [
+        "█   █ █   █ █   █ █   █ █   █",
+        " █ █   █ █  ██ ██  █ █   █ █ ",
+        "  █     █   █ █ █    █    █  ",
+        " █ █    █   █   █    █   █ █ ",
+        "█   █   █   █   █    █  █   █",
+      ];
+
+      // ---- Zustand der Animation ----
+      let width = 0;
+      let height = 0;
+      let dpr = 1;
+      let fontSize = 14;
+      let colCount = 0;
+      let rowCount = 0;
+      let columns = [];          // y-Position (Zeile) jeder Regentropfen-Spalte
+      let columnSpeeds = [];     // Fallgeschwindigkeit pro Spalte
+      let grid = [];             // Zeichenraster [Spalte][Zeile]
+      let logoMask = [];         // true = diese Zelle gehört zum Logo
+      let logoCells = [];        // Liste der Logo-Zellen {c, r}
+      let settledMask = [];      // [c][r] = true, wenn Logo-Zeichen fest sitzt
+      let startTime = 0;
+      let lastFrame = 0;
+      let logoPhase = false;     // true, sobald Logo-Phase läuft
+      let settleIndex = 0;
+      let glitchUntil = 0;       // Bis wann der Glitch-Effekt aktiv ist
+      let nextGlitchAt = 0;
+      let statusStarted = false;
+      let statusCharIndex = 0;
+      let statusLastType = 0;
+      let reducedMotion = false;
+      let logoTopPx = 0;         // für Position des Status-Texts
+      let logoHeightPx = 0;
+      let animId = 0;
+
+      // Zufälliges Zeichen aus dem Zeichensatz holen
+      function randomChar() {
+        return CHARSET[Math.floor(Math.random() * CHARSET.length)];
+      }
+
+      // Canvas an die aktuelle Fenstergröße anpassen (auch bei Drehung)
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);
+        width = window.innerWidth;
+        height = window.innerHeight;
+
+        canvas.width = Math.floor(width * dpr);
+        canvas.height = Math.floor(height * dpr);
+        canvas.style.width = width + "px";
+        canvas.style.height = height + "px";
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        // Schriftgröße an Bildschirmbreite anpassen
+        // Schmal (Handy): kleiner; breit (Desktop): größer
+        fontSize = Math.max(10, Math.min(18, Math.floor(width / 48)));
+
+        colCount = Math.ceil(width / fontSize);
+        rowCount = Math.ceil(height / fontSize) + 1;
+
+        // Spalten für den Regen neu initialisieren
+        columns = new Array(colCount);
+        columnSpeeds = new Array(colCount);
+        for (let i = 0; i < colCount; i++) {
+          columns[i] = Math.floor(Math.random() * rowCount);
+          columnSpeeds[i] = 0.4 + Math.random() * 0.8;
+        }
+
+        // Zeichenraster neu aufbauen
+        grid = new Array(colCount);
+        for (let c = 0; c < colCount; c++) {
+          grid[c] = new Array(rowCount);
+          for (let r = 0; r < rowCount; r++) {
+            grid[c][r] = randomChar();
+          }
+        }
+
+        buildLogoMask();
+        positionStatus();
+
+        // Bei reduced-motion: nur Logo zeichnen
+        if (reducedMotion) {
+          drawStaticLogo();
+        }
+      }
+
+      // Logo-Maske in die Mitte des Rasters legen
+      function buildLogoMask() {
+        logoMask = new Array(colCount);
+        for (let c = 0; c < colCount; c++) {
+          logoMask[c] = new Array(rowCount).fill(false);
+        }
+        logoCells = [];
+        settleIndex = 0;
+
+        // Schnelle Lookup-Tabelle: welche Zellen schon fest sind
+        settledMask = new Array(colCount);
+        for (let c = 0; c < colCount; c++) {
+          settledMask[c] = new Array(rowCount).fill(false);
+        }
+
+        const logoW = LOGO_ROWS[0].length;
+        const logoH = LOGO_ROWS.length;
+
+        // Logo horizontal skalieren, falls der Bildschirm zu schmal ist
+        // (wir nehmen nur jede n-te Spalte der ASCII-Art, wenn nötig)
+        let step = 1;
+        if (logoW > colCount - 2) {
+          step = Math.ceil(logoW / (colCount - 2));
+        }
+
+        const usedW = Math.ceil(logoW / step);
+        const startC = Math.max(0, Math.floor((colCount - usedW) / 2));
+        const startR = Math.max(1, Math.floor(rowCount * 0.32) - Math.floor(logoH / 2));
+
+        for (let r = 0; r < logoH; r++) {
+          const row = LOGO_ROWS[r];
+          let outC = 0;
+          for (let c = 0; c < logoW; c += step) {
+            const ch = row[c];
+            if (ch && ch !== " ") {
+              const gc = startC + outC;
+              const gr = startR + r;
+              if (gc >= 0 && gc < colCount && gr >= 0 && gr < rowCount) {
+                logoMask[gc][gr] = true;
+                logoCells.push({ c: gc, r: gr });
+              }
+            }
+            outC++;
+          }
+        }
+
+        // Logo-Zellen in zufälliger Reihenfolge „festsetzen“ (sieht natürlicher aus)
+        for (let i = logoCells.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          const tmp = logoCells[i];
+          logoCells[i] = logoCells[j];
+          logoCells[j] = tmp;
+        }
+
+        logoTopPx = startR * fontSize;
+        logoHeightPx = logoH * fontSize;
+      }
+
+      // Status-Text unter dem Logo positionieren
+      function positionStatus() {
+        const top = logoTopPx + logoHeightPx + fontSize * 1.8;
+        statusEl.style.top = Math.min(top, height - 40) + "px";
+      }
+
+      // ---- Zeichnen ----
+
+      // Eine Frame der Animation zeichnen
+      function drawFrame(now) {
+        // Trail-Effekt: dunkles Rechteck über das Bild → alte Zeichen verblassen
+        ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.font = fontSize + "px monospace";
+        ctx.textBaseline = "top";
+
+        const inLogoPhase = logoPhase;
+        const glitching = now < glitchUntil;
+
+        // Gelegentlich Logo-Zellen kurz glitchig machen
+        if (inLogoPhase && settleIndex >= logoCells.length) {
+          if (now >= nextGlitchAt) {
+            glitchUntil = now + 80 + Math.random() * 120;
+            nextGlitchAt = now + 1800 + Math.random() * 3500;
+          }
+        }
+
+        for (let c = 0; c < colCount; c++) {
+          // Tropfen fällt (auch nach dem Festsetzen des Logos weiter Regen)
+          columns[c] += columnSpeeds[c];
+          if (columns[c] > rowCount + 8) {
+            columns[c] = -Math.random() * 20;
+            columnSpeeds[c] = 0.4 + Math.random() * 0.8;
+          }
+
+          const head = Math.floor(columns[c]);
+
+          for (let r = 0; r < rowCount; r++) {
+            const isLogo = logoMask[c] && logoMask[c][r];
+            const isSettled = isLogo && settledMask[c][r];
+
+            // Am Kopf der Tropfen-Spalte: neues Zufallszeichen
+            if (r === head) {
+              grid[c][r] = randomChar();
+            } else if (!isSettled && Math.random() < 0.02) {
+              // Selten Zeichen im Trail ändern (mehr Leben)
+              grid[c][r] = randomChar();
+            }
+
+            // Entfernung zum Kopf → Helligkeit (heller am Kopf)
+            const dist = head - r;
+            if (dist < 0 || dist > 18) {
+              // Außerhalb des sichtbaren Trails – außer Logo-Zellen
+              if (!isSettled) continue;
+            }
+
+            let ch = grid[c][r];
+            let color;
+
+            if (isSettled) {
+              // Festgesetzte Logo-Zeichen: helles Grün + Glow
+              if (glitching && Math.random() < 0.35) {
+                // Kurz anderes Zeichen / andere Farbe = Glitch
+                ch = randomChar();
+                color = Math.random() < 0.5 ? "#aaffaa" : "#00ffaa";
+              } else {
+                color = "#66ff99";
+              }
+              ctx.shadowColor = "rgba(0, 255, 120, 0.85)";
+              ctx.shadowBlur = glitching ? 14 : 8;
+              ctx.fillStyle = color;
+              ctx.fillText(ch, c * fontSize, r * fontSize);
+              ctx.shadowBlur = 0;
+            } else if (dist === 0) {
+              // Kopf des Tropfens: fast weiß
+              ctx.fillStyle = "#d0ffd0";
+              ctx.fillText(ch, c * fontSize, r * fontSize);
+            } else if (dist > 0 && dist <= 18) {
+              // Trail: je weiter weg, desto dunkler
+              const alpha = 1 - dist / 18;
+              const g = Math.floor(40 + 180 * alpha);
+              ctx.fillStyle = "rgb(0," + g + ",40)";
+              ctx.fillText(ch, c * fontSize, r * fontSize);
+            }
+          }
+        }
+
+        // Nach und nach Logo-Zellen festsetzen
+        if (inLogoPhase && settleIndex < logoCells.length) {
+          // Mehrere Zellen pro Frame, damit es nicht zu lange dauert
+          const perFrame = Math.max(1, Math.ceil(logoCells.length / 45));
+          for (let n = 0; n < perFrame && settleIndex < logoCells.length; n++) {
+            const cell = logoCells[settleIndex];
+            settledMask[cell.c][cell.r] = true;
+            // Beim Festsetzen ein helles Zeichen setzen
+            grid[cell.c][cell.r] = randomChar();
+            settleIndex++;
+          }
+
+          // Wenn Logo fertig: Status-Text starten
+          if (settleIndex >= logoCells.length && !statusStarted) {
+            startStatusTyping(now);
+          }
+        }
+
+        // Tippen des Status-Texts
+        if (statusStarted && statusCharIndex < STATUS_TEXT.length) {
+          if (now - statusLastType > 70) {
+            statusCharIndex++;
+            statusTextEl.textContent = STATUS_TEXT.slice(0, statusCharIndex);
+            statusLastType = now;
+          }
+        }
+      }
+
+      // Tippen starten und Status sichtbar machen
+      function startStatusTyping(now) {
+        statusStarted = true;
+        statusCharIndex = 0;
+        statusLastType = now;
+        statusEl.style.opacity = "1";
+        statusTextEl.textContent = "";
+        nextGlitchAt = now + 1200;
+      }
+
+      // Statisches Logo für prefers-reduced-motion
+      function drawStaticLogo() {
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, width, height);
+        ctx.font = fontSize + "px monospace";
+        ctx.textBaseline = "top";
+        ctx.shadowColor = "rgba(0, 255, 120, 0.7)";
+        ctx.shadowBlur = 8;
+        ctx.fillStyle = "#66ff99";
+
+        for (let i = 0; i < logoCells.length; i++) {
+          const cell = logoCells[i];
+          ctx.fillText(randomChar(), cell.c * fontSize, cell.r * fontSize);
+        }
+        ctx.shadowBlur = 0;
+
+        // Status sofort zeigen (kein Tippen)
+        statusEl.style.opacity = "1";
+        statusTextEl.textContent = STATUS_TEXT;
+      }
+
+      // ---- Hauptschleife ----
+      function loop(now) {
+        animId = requestAnimationFrame(loop);
+
+        // Framerate begrenzen
+        if (now - lastFrame < FRAME_MS) return;
+        lastFrame = now;
+
+        // Logo-Phase nach Verzögerung starten
+        if (!logoPhase && now - startTime >= LOGO_DELAY_MS) {
+          logoPhase = true;
+        }
+
+        drawFrame(now);
+      }
+
+      // ---- Start ----
+      function init() {
+        // Nutzer möchte weniger Bewegung? → nur statisches Logo
+        reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+        resize();
+        startTime = performance.now();
+        lastFrame = 0;
+
+        if (reducedMotion) {
+          drawStaticLogo();
+          return;
+        }
+
+        // Ersten Frame schwarz füllen
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, width, height);
+        animId = requestAnimationFrame(loop);
+      }
+
+      // Bei Größenänderung / Drehung neu berechnen
+      let resizeTimer = 0;
+      window.addEventListener("resize", function () {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(function () {
+          const wasLogo = logoPhase;
+          const wasSettled = settleIndex;
+          const hadStatus = statusStarted;
+          const typed = statusCharIndex;
+
+          resize();
+
+          // Zustand möglichst erhalten
+          if (reducedMotion) return;
+
+          logoPhase = wasLogo;
+          if (wasLogo) {
+            // Logo-Zustand nach Resize wiederherstellen
+            settleIndex = Math.min(wasSettled, logoCells.length);
+            for (let i = 0; i < settleIndex; i++) {
+              const cell = logoCells[i];
+              settledMask[cell.c][cell.r] = true;
+            }
+          }
+          if (hadStatus) {
+            statusStarted = true;
+            statusCharIndex = typed;
+            statusEl.style.opacity = "1";
+            statusTextEl.textContent = STATUS_TEXT.slice(0, statusCharIndex);
+          }
+        }, 120);
+      });
+
+      // Auch reagieren, wenn der Nutzer reduced-motion umschaltet
+      const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+      function onMotionChange(e) {
+        reducedMotion = e.matches;
+        if (animId) {
+          cancelAnimationFrame(animId);
+          animId = 0;
+        }
+        logoPhase = false;
+        settleIndex = 0;
+        statusStarted = false;
+        statusCharIndex = 0;
+        statusTextEl.textContent = "";
+        statusEl.style.opacity = "0";
+        startTime = performance.now();
+        lastFrame = 0;
+        resize();
+        if (reducedMotion) {
+          drawStaticLogo();
+        } else {
+          ctx.fillStyle = "#000";
+          ctx.fillRect(0, 0, width, height);
+          animId = requestAnimationFrame(loop);
+        }
+      }
+      if (motionQuery.addEventListener) {
+        motionQuery.addEventListener("change", onMotionChange);
+      } else if (motionQuery.addListener) {
+        // Ältere Browser
+        motionQuery.addListener(onMotionChange);
+      }
+
+      init();
+    })();
+  </script>
+</body>
+</html>
